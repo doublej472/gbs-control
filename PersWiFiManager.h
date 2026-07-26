@@ -6,12 +6,12 @@
    see /3rdparty/PersWiFiManager/ for original code and license
 */
 #include "config.h"
-#if defined(ESP8266) && ENABLE_WIFI
+#if ENABLE_WIFI
 #ifndef PERSWIFIMANAGER_H
 #define PERSWIFIMANAGER_H
 
-#include <ESP8266WiFi.h>
-#include <ESPAsyncTCP.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <DNSServer.h>
 

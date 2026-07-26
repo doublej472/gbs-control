@@ -112,18 +112,16 @@
 //   TLS lib need a sync interface!
 
 #if defined(ESP8266)
-#include <ESP8266WiFi.h>
+#include <WiFi.h>
 #elif defined(ESP32)
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#elif defined(ESP31B)
-#include <ESP31BWiFi.h>
 #else
 #error "network type ESP8266 ASYNC only possible on the ESP mcu!"
 #endif
 
-#include <ESPAsyncTCP.h>
-#include <ESPAsyncTCPbuffer.h>
+#include <AsyncTCP.h>
+#include <AsyncTCPbuffer.h>
 #define WEBSOCKETS_NETWORK_CLASS AsyncTCPbuffer
 #define WEBSOCKETS_NETWORK_SERVER_CLASS AsyncServer
 
@@ -134,9 +132,9 @@
 #endif
 
 #ifdef ESP8266
-#include <ESP8266WiFi.h>
+#include <WiFi.h>
 #else
-#include <ESP31BWiFi.h>
+#include <WiFi.h>
 #endif
 #define WEBSOCKETS_NETWORK_CLASS WiFiClient
 #define WEBSOCKETS_NETWORK_SSL_CLASS WiFiClientSecure
