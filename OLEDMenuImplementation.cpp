@@ -12,8 +12,7 @@
 #include "tv5725.h"
 #include "slot.h"
 #if ENABLE_WIFI
-#include "src/WebSockets.h"
-#include "src/WebSocketsServer.h"
+#include <ESPAsyncWebServer.h>
 #endif
 #include "fonts.h"
 #include "OSDManager.h"
@@ -31,7 +30,7 @@ extern userOptions *uopt;
 extern const char *ap_ssid;
 extern const char *ap_password;
 extern const char *device_hostname_full;
-extern WebSocketsServer webSocket;
+extern AsyncWebSocket ws;
 #endif
 extern OLEDMenuManager oledMenu;
 extern OSDManager osdManager;
@@ -206,7 +205,7 @@ bool resetMenuHandler(OLEDMenuManager *manager, OLEDMenuItem *item, OLEDMenuNav,
     }
     display->display();
 #if ENABLE_WIFI
-    webSocket.close();
+    ws.closeAll();
 #endif
     delay(50);
     switch (item->tag) {

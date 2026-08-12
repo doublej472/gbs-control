@@ -3294,7 +3294,7 @@ const initUI = () => {
 const main = () => {
     const ip = location.hostname;
     GBSControl.serverIP = ip;
-    GBSControl.webSocketServerUrl = `ws://${ip}:81/`;
+    GBSControl.webSocketServerUrl = `ws://${ip}/ws`; // async WS, same server/port as the page
     document
         .querySelector(".gbs-loader img")
         .setAttribute("src", document.head

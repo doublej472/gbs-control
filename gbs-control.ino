@@ -88,12 +88,9 @@ volatile int oled_sub_pointer = 0;
 // See 3rdparty/PersWiFiManager for unmodified source and license
 #include "PersWiFiManager.h"
 
-// WebSockets library by Markus Sattler
-// https://github.com/Links2004/arduinoWebSockets
-// included in src folder to allow header modifications within limitations of the Arduino framework
-// See 3rdparty/WebSockets for unmodified source and license
-#include "src/WebSockets.h"
-#include "src/WebSocketsServer.h"
+// WebSockets for the web UI is provided by AsyncWebSocket (part of
+// ESPAsyncWebServer): fully event-driven, all TCP I/O handled by the
+// AsyncTCP service task on core 0, no polling from the main loop.
 #endif
 
 // Optional:
@@ -153,8 +150,7 @@ static const char st_info_string[] PROGMEM =
 #if ENABLE_WIFI
 AsyncWebServer server(80);
 DNSServer dnsServer;
-WebSocketsServer webSocket(81);
-//AsyncWebSocket webSocket("/ws");
+AsyncWebSocket ws("/ws"); // async WebSocket on port 80 at /ws (replaces the old port-81 server)
 PersWiFiManager persWM(server, dnsServer);
 #endif
 
@@ -229,65 +225,139 @@ static uint8_t lastSegment = 0xFF; // GBS segment for direct access
 
 #if ENABLE_WIFI
 // serial mirror class for websocket logs
+// SerialM output is *queued* here and flushed to WebSocket clients from
+// handleWiFi() (main loop task only). This keeps blocking TCP writes out of
+// the video pipeline and out of the async HTTP handler task, and guarantees
+// all WebSocket access happens on the main loop task.
+#include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 class SerialMirror : public Stream
 {
-    size_t write(const uint8_t *data, size_t size)
+  public:
+    SerialMirror()
     {
-        if (ESP.getFreeHeap() > 20000) {
-            webSocket.broadcastTXT(data, size);
-        } else {
-            webSocket.disconnect();
-        }
+        mtx = xSemaphoreCreateMutex();
+    }
+
+    size_t write(const uint8_t *data, size_t size) override
+    {
+        enqueue(data, size);
         Serial.write(data, size);
         return size;
     }
 
     size_t write(const char *data, size_t size)
     {
-        if (ESP.getFreeHeap() > 20000) {
-            webSocket.broadcastTXT(data, size);
-        } else {
-            webSocket.disconnect();
-        }
+        enqueue((const uint8_t *)data, size);
         Serial.write(data, size);
         return size;
     }
 
-    size_t write(uint8_t data)
+    size_t write(uint8_t data) override
     {
-        if (ESP.getFreeHeap() > 20000) {
-            webSocket.broadcastTXT(&data, 1);
-        } else {
-            webSocket.disconnect();
-        }
+        enqueue(&data, 1);
         Serial.write(data);
         return 1;
     }
 
     size_t write(char data)
     {
-        if (ESP.getFreeHeap() > 20000) {
-            webSocket.broadcastTXT(&data, 1);
-        } else {
-            webSocket.disconnect();
-        }
+        enqueue((const uint8_t *)&data, 1);
         Serial.write(data);
         return 1;
     }
 
-    int available()
+    int available() override
     {
         return 0;
     }
-    int read()
+    int read() override
     {
         return -1;
     }
-    int peek()
+    int peek() override
     {
         return -1;
     }
-    void flush() {}
+    void flush() override {}
+
+    // Consumer side - main loop task only. Drains up to maxBytes queued bytes
+    // to WebSocket clients, dropping everything under memory pressure instead
+    // of disconnecting clients.
+    size_t flushToWebSocket(size_t maxBytes)
+    {
+        if (ESP.getFreeHeap() < 14000) {
+            // low memory: drop pending log data rather than kick clients
+            tail.store(head.load(std::memory_order_acquire), std::memory_order_relaxed);
+            return 0;
+        }
+
+        constexpr size_t CHUNK = 512;
+        uint8_t chunk[CHUNK];
+        size_t drained = 0;
+
+        while (drained < maxBytes) {
+            size_t h = head.load(std::memory_order_acquire);
+            size_t t = tail.load(std::memory_order_relaxed);
+            size_t avail = (h + BUF_SIZE - t) % BUF_SIZE;
+            if (avail == 0) {
+                break;
+            }
+
+            size_t n = avail < CHUNK ? avail : CHUNK;
+            if (drained + n > maxBytes) {
+                n = maxBytes - drained;
+            }
+
+            // copy out, wrapping past the end of the ring
+            size_t toEnd = BUF_SIZE - t;
+            size_t a = n < toEnd ? n : toEnd;
+            memcpy(chunk, queue + t, a);
+            if (n > a) {
+                memcpy(chunk + a, queue, n - a);
+            }
+
+            tail.store((t + n) % BUF_SIZE, std::memory_order_release);
+            ws.textAll(chunk, n); // async: enqueues to the AsyncTCP task, never blocks
+            drained += n;
+        }
+        return drained;
+    }
+
+  private:
+    static constexpr size_t BUF_SIZE = 4096;
+    uint8_t queue[BUF_SIZE];
+    std::atomic<size_t> head{0}; // producer-owned (multi-producer, under mtx)
+    std::atomic<size_t> tail{0}; // consumer-owned
+    SemaphoreHandle_t mtx;
+
+    // Producer side - may be called from the main loop AND from async HTTP
+    // handlers, so writes are serialized. Drops the line if the ring is full.
+    void enqueue(const uint8_t *data, size_t len)
+    {
+        if (!mtx || len == 0 || len > BUF_SIZE - 1) {
+            return;
+        }
+        if (xSemaphoreTake(mtx, 0) != pdTRUE) {
+            return; // contention: drop rather than block the caller
+        }
+
+        size_t h = head.load(std::memory_order_relaxed);
+        size_t t = tail.load(std::memory_order_acquire);
+        size_t used = (h + BUF_SIZE - t) % BUF_SIZE;
+
+        if (used + len <= BUF_SIZE - 1) {
+            size_t toEnd = BUF_SIZE - h;
+            size_t a = len < toEnd ? len : toEnd;
+            memcpy(queue + h, data, a);
+            if (len > a) {
+                memcpy(queue, data + a, len - a);
+            }
+            head.store((h + len) % BUF_SIZE, std::memory_order_release);
+        }
+        xSemaphoreGive(mtx);
+    }
 };
 
 SerialMirror SerialM;
@@ -7636,7 +7706,8 @@ void discardSerialRxData()
 void updateWebSocketData()
 {
     if (rto->webServerEnabled && rto->webServerStarted) {
-        if (webSocket.connectedClients() > 0) {
+        if (ws.count() > 0) {
+
 
             constexpr size_t MESSAGE_LEN = 6;
             char toSend[MESSAGE_LEN] = {0};
@@ -7733,12 +7804,11 @@ void updateWebSocketData()
                 toSend[5] |= (1 << 2);
             }
 
-            // send ping and stats
+            // send ping and stats (skip, don't disconnect, when memory is low)
             if (ESP.getFreeHeap() > 14000) {
-                webSocket.broadcastTXT(toSend, MESSAGE_LEN);
-            } else {
-                webSocket.disconnect();
+                ws.textAll(toSend, MESSAGE_LEN);
             }
+
         }
     }
 }
@@ -7749,12 +7819,14 @@ void handleWiFi(boolean instant)
     if (rto->webServerEnabled && rto->webServerStarted) {
         persWM.handleWiFi(); // if connected, returns instantly. otherwise it reconnects or opens AP
         dnsServer.processNextRequest();
+        SerialM.flushToWebSocket(2048); // bounded: drain the log queue to WS clients (async, non-blocking)
+        ws.cleanupClients(); // reap dead clients (AsyncWebSocket needs this from loop context)
 
         if ((millis() - lastTimePing) > 953) { // slightly odd value so not everything happens at once
-            webSocket.broadcastPing();
+            ws.pingAll();
         }
         if (((millis() - lastTimePing) > 973) || instant) {
-            if ((webSocket.connectedClients(false) > 0) || instant) { // true = with compliant ping
+            if ((ws.count() > 0) || instant) {
                 updateWebSocketData();
             }
             lastTimePing = millis();
@@ -8973,7 +9045,7 @@ void handleType2Command(char argument)
         case '1':
             // reset to defaults button
 #if ENABLE_WIFI
-            webSocket.close();
+            ws.closeAll();
 #endif
             loadDefaultUserOptions();
             saveUserPrefs();
@@ -9037,7 +9109,7 @@ void handleType2Command(char argument)
             break;
         case 'a':
 #if ENABLE_WIFI
-            webSocket.close();
+            ws.closeAll();
 #endif
             Serial.println(F("restart"));
             delay(60);
@@ -9522,24 +9594,6 @@ void handleType2Command(char argument)
     }
 }
 
-//void webSocketEvent(uint8_t num, uint8_t type, uint8_t * payload, size_t length) {
-//  switch (type) {
-//  case WStype_DISCONNECTED:
-//    //Serial.print("WS: #"); Serial.print(num); Serial.print(" disconnected,");
-//    //Serial.print(" remaining: "); Serial.println(webSocket.connectedClients());
-//  break;
-//  case WStype_CONNECTED:
-//    //Serial.print("WS: #"); Serial.print(num); Serial.print(" connected, ");
-//    //Serial.print(" total: "); Serial.println(webSocket.connectedClients());
-//    updateWebSocketData();
-//  break;
-//  case WStype_PONG:
-//    //Serial.print("p");
-//    updateWebSocketData();
-//  break;
-//  }
-//}
-
 #if ENABLE_WIFI
 void startWebserver()
 {
@@ -9563,6 +9617,8 @@ void startWebserver()
             AsyncWebServerResponse *response = request->beginResponse_P(200, "text/html", webui_html, webui_html_len);
             response->addHeader("Content-Encoding", "gzip");
             request->send(response);
+        } else {
+            request->send(503, "text/plain", "low memory");
         }
     });
 
@@ -9582,6 +9638,8 @@ void startWebserver()
                 }
             }
             request->send(200); // reply
+        } else {
+            request->send(503, "application/json", "false");
         }
     });
 
@@ -9596,6 +9654,8 @@ void startWebserver()
                 userCommand = p->name().charAt(0);
             }
             request->send(200); // reply
+        } else {
+            request->send(503, "application/json", "false");
         }
     });
 
@@ -9643,6 +9703,8 @@ void startWebserver()
             }
 
             request->send(LittleFS, "/slots.bin", "application/octet-stream");
+        } else {
+            request->send(503, "application/json", "false");
         }
     });
 
@@ -9738,10 +9800,10 @@ void startWebserver()
     server.on("/slot/remove", HTTP_GET, [](AsyncWebServerRequest *request) {
         bool result = false;
         int params = request->params();
-        const AsyncWebParameter *p = request->getParam((size_t)0);
-        char param = p->name().charAt(0);
         if (params > 0)
         {
+            const AsyncWebParameter *p = request->getParam((size_t)0);
+            char param = p->name().charAt(0);
             if (param == '0')
             {
                 SerialM.println("Wait...");
@@ -9910,7 +9972,7 @@ void startWebserver()
         request->send(200, "application/json", result ? "true" : "false");
     });
 
-    //webSocket.onEvent(webSocketEvent);
+    // (async WebSocket needs no event callback; the web UI sends its commands over HTTP)
 
     persWM.setConnectNonBlock(true);
     if (WiFi.SSID().length() == 0) {
@@ -9921,8 +9983,9 @@ void startWebserver()
         persWM.begin(); // first try connecting to stored network, go AP mode after timeout
     }
 
-    server.begin();    // Webserver for the site
-    webSocket.begin(); // Websocket for interaction
+    server.begin(); // Webserver for the site
+    server.addHandler(&ws); // async WebSocket at /ws on port 80
+    ws.enable(true);        // accept the "arduino" subprotocol the web UI requests
     yield();
 
 #ifdef HAVE_PINGER_LIBRARY
@@ -10702,7 +10765,7 @@ void settingsMenuOLED()
                 display.drawString(0, 30, "Please Wait...");
                 display.display();
             }
-            webSocket.close();
+            ws.closeAll();
             delay(60);
             ESP.restart();
             oled_selectOption = 0;
@@ -10717,7 +10780,7 @@ void settingsMenuOLED()
                 display.drawString(0, 30, "Please Wait...");
                 display.display();
             }
-            webSocket.close();
+            ws.closeAll();
             loadDefaultUserOptions();
             saveUserPrefs();
             delay(60);

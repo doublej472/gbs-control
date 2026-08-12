@@ -107,7 +107,7 @@ void PersWiFiManager::setupWiFiHandlers()
         String s = "";
         if (n == -2) {
             WiFi.scanNetworks(true);
-        } else if (n) {
+        } else if (n > 0) { // guard against -1 (scan in progress): would form a negative-sized VLA
             //build array of indices
             int ix[n];
             for (int i = 0; i < n; i++)
